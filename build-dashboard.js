@@ -1,0 +1,371 @@
+/**
+ * BBSS Ideas Dashboard Builder
+ * Fetches all tasks from the ClickUp Ideas list and generates a self-contained HTML dashboard.
+ * Runs via GitHub Actions on a schedule.
+ */
+
+const https = require('https');
+const fs = require('fs');
+
+const API_TOKEN = process.env.CLICKUP_API_TOKEN;
+const LIST_ID = process.env.CLICKUP_LIST_ID || '116394162';
+
+if (!API_TOKEN) {
+  console.error('ERROR: CLICKUP_API_TOKEN environment variable is required');
+  process.exit(1);
+}
+
+// ── ClickUp API helper ──────────────────────────────────────────────
+function clickupGet(path) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.clickup.com',
+      path: `/api/v2${path}`,
+      method: 'GET',
+      headers: { 'Authorization': API_TOKEN, 'Content-Type': 'application/json' }
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error(`Failed to parse response: ${data.slice(0, 200)}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ── Fetch all tasks (handles pagination) ────────────────────────────
+async function fetchAllTasks() {
+  let allTasks = [];
+  let page = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    console.log(`Fetching page ${page}...`);
+    const result = await clickupGet(
+      `/list/${LIST_ID}/task?page=${page}&subtasks=true&include_closed=true&order_by=created&reverse=true`
+    );
+
+    if (!result.tasks || result.tasks.length === 0) {
+      hasMore = false;
+    } else {
+      allTasks = allTasks.concat(result.tasks);
+      // ClickUp returns 100 tasks per page by default
+      if (result.tasks.length < 100) hasMore = false;
+      else page++;
+    }
+  }
+
+  console.log(`Total tasks fetched: ${allTasks.length}`);
+  return allTasks;
+}
+
+// ── Transform ClickUp tasks into dashboard data ─────────────────────
+function transformTasks(tasks) {
+  // Build a map of task IDs to names for parent lookups
+  const taskMap = {};
+  tasks.forEach(t => { taskMap[t.id] = t.name; });
+
+  return tasks.map(task => {
+    const parentId = task.parent;
+    const parentName = parentId ? (taskMap[parentId] || null) : null;
+    const status = task.status ? task.status.status : 'unknown';
+    const assignees = (task.assignees || []).map(a => a.username || a.email || '').filter(Boolean).join(', ');
+    const dateCreated = task.date_created ? new Date(parseInt(task.date_created)).toISOString().split('T')[0] : null;
+    const dateUpdated = task.date_updated ? new Date(parseInt(task.date_updated)).toISOString().split('T')[0] : null;
+    const customId = task.custom_id || null;
+    const url = task.url || `https://app.clickup.com/t/${task.id}`;
+
+    // Category assignment based on parent grouping and name keywords
+    const category = assignCategory(task.name, parentName, task.tags);
+
+    return {
+      id: task.id,
+      name: task.name.trim(),
+      status: status,
+      customId: customId,
+      parentName: parentName,
+      category: category,
+      assignees: assignees,
+      url: url,
+      dateCreated: dateCreated,
+      dateUpdated: dateUpdated,
+    };
+  });
+}
+
+function assignCategory(name, parentName, tags) {
+  const n = (name + ' ' + (parentName || '')).toLowerCase();
+
+  // Check known parent groupings first
+  if (parentName) {
+    const p = parentName.toLowerCase();
+    if (p.includes('report')) return 'Reports';
+    if (p.includes('registration')) return 'Customer Registration';
+    if (p.includes('communication')) return 'Communications';
+    if (p.includes('trial')) return 'Trials';
+    if (p.includes('schedule update') || p.includes('staff schedule')) return 'Staff Management';
+    if (p.includes('navigation') || p.includes('lessonbuddy')) return 'LessonBuddy UI';
+    if (p.includes('mobile app') || p.includes('push notification') || p.includes('demo mobile')) return 'Mobile App';
+    if (p.includes('swag') || p.includes('marketing')) return 'Marketing';
+    if (p.includes('pricing') || p.includes('package')) return 'Pricing';
+    if (p.includes('crm')) return 'CRM';
+    if (p.includes('account') || p.includes('family')) return 'Customer Account';
+    if (p.includes('voucher') || p.includes('payment') || p.includes('coupon')) return 'Payments';
+    if (p.includes('pilot')) return 'Pilots';
+    if (p.includes('training')) return 'Training';
+    if (p.includes('lobby') || p.includes('tv content')) return 'Marketing';
+    if (p.includes('curriculum')) return 'Curriculum';
+  }
+
+  // Keyword-based assignment
+  if (n.includes('report') || n.includes('ltv') || n.includes('capacity management')) return 'Reports';
+  if (n.includes('schedule') && (n.includes('suppression') || n.includes('optimization') || n.includes('filter') || n.includes('share'))) return 'Scheduling';
+  if (n.includes('trial')) return 'Trials';
+  if (n.includes('registration') || n.includes('enroll') || n.includes('zip code') || n.includes('classroom occupancy')) return 'Customer Registration';
+  if (n.includes('app') || n.includes('mobile') || n.includes('push notification') || n.includes('geofenc')) return 'Mobile App';
+  if (n.includes('email') || n.includes('communication') || n.includes('notification') || n.includes('policy reminder')) return 'Communications';
+  if (n.includes('crm')) return 'CRM';
+  if (n.includes('pricing') || n.includes('package') || n.includes('dynamic')) return 'Pricing';
+  if (n.includes('payment') || n.includes('ach') || n.includes('credit card') || n.includes('voucher') || n.includes('coupon') || n.includes('subscription')) return 'Payments';
+  if (n.includes('staff') || n.includes('shift leader') || n.includes('teacher schedule') || n.includes('schedule print')) return 'Staff Management';
+  if (n.includes('lessonbuddy') || n.includes('lesson buddy') || n.includes('named tab') || n.includes('redirect on login') || n.includes('offline') || n.includes('backpack number') || n.includes('mismatch') || n.includes('disclaimer')) return 'LessonBuddy UI';
+  if (n.includes('merch') || n.includes('swag') || n.includes('lobby') || n.includes('poster') || n.includes('pamphlet') || n.includes('charm') || n.includes('coloring') || n.includes('backpack') || n.includes('tote') || n.includes('gift') || n.includes('referral')) return 'Marketing';
+  if (n.includes('account') || n.includes('family') || n.includes('duplicate') || n.includes('divorced') || n.includes('birthdate') || n.includes('hide') || n.includes('blocking 13')) return 'Customer Account';
+  if (n.includes('training') || n.includes('301 refresh') || n.includes('demo account')) return 'Training';
+  if (n.includes('curriculum') || n.includes('backstroke') || n.includes('bold 2') || n.includes('baby instruction')) return 'Curriculum';
+  if (n.includes('pilot') || n.includes('scuba') || n.includes('bolder blue') || n.includes('mock meet')) return 'Pilots';
+  if (n.includes('audit') || n.includes('compliance') || n.includes('sop') || n.includes('checklist') || n.includes('cpr') || n.includes('withdraw') || n.includes('tlc')) return 'Operations';
+  if (n.includes('promotion')) return 'Marketing';
+  if (n.includes('pool')) return 'Facilities';
+  if (n.includes('schedule')) return 'Scheduling';
+
+  return 'Other';
+}
+
+// ── Generate the HTML dashboard ─────────────────────────────────────
+function generateHTML(ideas) {
+  const now = new Date().toISOString().split('T')[0] + ' ' + new Date().toISOString().split('T')[1].slice(0, 5) + ' UTC';
+  const ideasJSON = JSON.stringify(ideas, null, 0);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BBSS Ideas Triage Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"><\/script>
+    <style>
+        :root {
+            --bg-primary:#f0f4f8;--bg-card:#ffffff;--bg-header:#0B3D91;--bg-header-accent:#1565C0;
+            --text-primary:#1a2332;--text-secondary:#5a6a7e;--text-on-dark:#ffffff;
+            --bbss-blue:#0B3D91;--bbss-light-blue:#4FC3F7;--bbss-gold:#FFB300;
+            --positive:#2e7d32;--negative:#c62828;--neutral:#6c757d;
+            --gap:16px;--radius:10px;--shadow:0 2px 8px rgba(0,0,0,0.08);
+        }
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg-primary);color:var(--text-primary);line-height:1.5}
+        .dashboard-container{max-width:1500px;margin:0 auto;padding:var(--gap)}
+        .dashboard-header{background:linear-gradient(135deg,var(--bg-header) 0%,var(--bg-header-accent) 100%);color:var(--text-on-dark);padding:20px 28px;border-radius:var(--radius);margin-bottom:var(--gap)}
+        .header-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px}
+        .header-top h1{font-size:22px;font-weight:700}
+        .header-top h1 span{color:var(--bbss-gold)}
+        .header-subtitle{font-size:13px;opacity:0.8;margin-bottom:16px}
+        .last-updated{font-size:11px;opacity:0.6;margin-bottom:12px}
+        .filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+        .filter-group{display:flex;flex-direction:column;gap:3px}
+        .filter-group label{font-size:11px;color:rgba(255,255,255,0.65);text-transform:uppercase;letter-spacing:0.5px}
+        .filter-group select,.filter-group input{padding:6px 10px;border:1px solid rgba(255,255,255,0.25);border-radius:5px;background:rgba(255,255,255,0.12);color:var(--text-on-dark);font-size:13px;min-width:140px}
+        .filter-group select option{background:#1a2332;color:#fff}
+        .filter-group input::placeholder{color:rgba(255,255,255,0.4)}
+        .btn-reset{padding:6px 14px;background:var(--bbss-gold);color:#1a2332;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer;align-self:flex-end}
+        .btn-reset:hover{background:#FFC107}
+        .kpi-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:var(--gap);margin-bottom:var(--gap)}
+        .kpi-card{background:var(--bg-card);border-radius:var(--radius);padding:16px 20px;box-shadow:var(--shadow);border-left:4px solid var(--bbss-blue)}
+        .kpi-label{font-size:11px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:2px}
+        .kpi-value{font-size:28px;font-weight:700;color:var(--text-primary)}
+        .kpi-sub{font-size:12px;color:var(--text-secondary);margin-top:2px}
+        .chart-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:var(--gap);margin-bottom:var(--gap)}
+        .chart-container{background:var(--bg-card);border-radius:var(--radius);padding:20px 24px;box-shadow:var(--shadow)}
+        .chart-container h3{font-size:14px;font-weight:600;color:var(--text-primary);margin-bottom:14px}
+        .chart-container canvas{max-height:280px}
+        .view-tabs{display:flex;gap:8px;margin-bottom:var(--gap)}
+        .view-tab{padding:8px 18px;background:var(--bg-card);border:2px solid #e0e0e0;border-radius:20px;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.2s}
+        .view-tab.active{background:var(--bbss-blue);color:#fff;border-color:var(--bbss-blue)}
+        .view-tab:hover:not(.active){border-color:var(--bbss-blue);color:var(--bbss-blue)}
+        .mindmap-section{background:var(--bg-card);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow);margin-bottom:var(--gap);min-height:500px;position:relative;overflow:auto}
+        .mindmap-center{display:flex;flex-direction:column;align-items:center;gap:24px}
+        .mm-cluster{width:100%;border:2px solid #e0e7ef;border-radius:12px;padding:16px;background:#f8fafd}
+        .mm-cluster-header{display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer;user-select:none}
+        .mm-cluster-header h4{font-size:15px;font-weight:700;color:var(--bbss-blue)}
+        .mm-cluster-badge{background:var(--bbss-blue);color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px}
+        .mm-cluster-toggle{margin-left:auto;font-size:18px;color:var(--text-secondary)}
+        .mm-items{display:flex;flex-wrap:wrap;gap:8px}
+        .mm-items.collapsed{display:none}
+        .mm-item{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:8px;font-size:12px;cursor:pointer;transition:all 0.2s;border:1px solid #e0e7ef;background:#fff;max-width:320px}
+        .mm-item:hover{transform:translateY(-1px);box-shadow:0 3px 8px rgba(0,0,0,0.12)}
+        .mm-item .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+        .mm-item .name{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .mm-item .effort-tag{font-size:10px;padding:1px 6px;border-radius:4px;font-weight:600;flex-shrink:0}
+        .effort-low{background:#e8f5e9;color:#2e7d32}
+        .effort-med{background:#fff3e0;color:#e65100}
+        .effort-high{background:#fce4ec;color:#c62828}
+        .table-section{background:var(--bg-card);border-radius:var(--radius);padding:20px 24px;box-shadow:var(--shadow);overflow-x:auto;margin-bottom:var(--gap)}
+        .table-section h3{font-size:14px;font-weight:600;margin-bottom:14px}
+        .table-controls{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px}
+        .table-count{font-size:13px;color:var(--text-secondary)}
+        .data-table{width:100%;border-collapse:collapse;font-size:12px}
+        .data-table thead th{text-align:left;padding:10px 10px;border-bottom:2px solid #dee2e6;color:var(--text-secondary);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:0.3px;white-space:nowrap;user-select:none;cursor:pointer;position:sticky;top:0;background:#fff}
+        .data-table thead th:hover{color:var(--text-primary);background:#f8f9fa}
+        .data-table tbody td{padding:8px 10px;border-bottom:1px solid #f0f0f0}
+        .data-table tbody tr:hover{background:#f0f7ff}
+        .status-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;white-space:nowrap}
+        .status-open{background:#e3f2fd;color:#1565C0}
+        .status-review{background:#fff3e0;color:#e65100}
+        .status-ready{background:#f3e5f5;color:#7B1FA2}
+        .status-progress{background:#e8f5e9;color:#2e7d32}
+        .status-closed{background:#f5f5f5;color:#757575}
+        .status-other{background:#fafafa;color:#9e9e9e}
+        .category-tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;background:#e8eaf6;color:#283593}
+        .age-badge{font-size:11px;font-weight:600}
+        .age-new{color:#2e7d32}.age-mid{color:#e65100}.age-old{color:#c62828}.age-legacy{color:#6a1b9a}
+        a.task-link{color:var(--bbss-blue);text-decoration:none;font-weight:500}
+        a.task-link:hover{text-decoration:underline}
+        .detail-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.4);z-index:1000;justify-content:center;align-items:center}
+        .detail-overlay.active{display:flex}
+        .detail-panel{background:#fff;border-radius:12px;padding:28px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,0.3)}
+        .detail-panel h2{font-size:18px;margin-bottom:12px;color:var(--bbss-blue)}
+        .detail-row{display:flex;gap:12px;margin-bottom:8px;font-size:13px}
+        .detail-label{font-weight:600;color:var(--text-secondary);min-width:120px}
+        .detail-value{color:var(--text-primary)}
+        .detail-close{float:right;background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-secondary)}
+        .detail-close:hover{color:var(--text-primary)}
+        .matrix-section{background:var(--bg-card);border-radius:var(--radius);padding:24px;box-shadow:var(--shadow);margin-bottom:var(--gap)}
+        .matrix-grid{display:grid;grid-template-columns:auto 1fr 1fr 1fr;grid-template-rows:auto 1fr 1fr 1fr;gap:2px;min-height:400px}
+        .matrix-corner{background:#f8f9fa;padding:8px;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--text-secondary)}
+        .matrix-col-header{background:#f0f4f8;padding:8px;text-align:center;font-size:12px;font-weight:700;color:var(--bbss-blue)}
+        .matrix-row-header{background:#f0f4f8;padding:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:var(--bbss-blue);writing-mode:vertical-lr;transform:rotate(180deg)}
+        .matrix-cell{border:1px solid #e8ecf0;padding:8px;overflow-y:auto;max-height:200px;min-height:100px}
+        .matrix-cell.quickwin{background:#e8f5e9}.matrix-cell.strategic{background:#e3f2fd}.matrix-cell.filler{background:#fffde7}.matrix-cell.avoid{background:#fce4ec}
+        .matrix-chip{display:inline-block;padding:2px 8px;margin:2px;border-radius:4px;font-size:10px;font-weight:500;background:#fff;border:1px solid #ddd;cursor:pointer}
+        .matrix-chip:hover{background:var(--bbss-blue);color:#fff;border-color:var(--bbss-blue)}
+        .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;font-size:12px}
+        .legend-item{display:flex;align-items:center;gap:4px}
+        .legend-dot{width:12px;height:12px;border-radius:3px}
+        @media(max-width:768px){.chart-row{grid-template-columns:1fr}.kpi-row{grid-template-columns:repeat(2,1fr)}.filters{flex-direction:column;align-items:stretch}.matrix-grid{font-size:10px}}
+    </style>
+</head>
+<body>
+<div class="dashboard-container">
+    <div class="dashboard-header">
+        <div class="header-top">
+            <h1>Big Blue Swim School - <span>Ideas Triage</span></h1>
+            <button class="btn-reset" onclick="dashboard.resetFilters()">Reset Filters</button>
+        </div>
+        <div class="last-updated">Last refreshed: ${now}</div>
+        <div class="header-subtitle">Live dashboard - auto-refreshes from ClickUp every 2 hours during business hours.</div>
+        <div class="filters">
+            <div class="filter-group"><label>Status</label><select id="filter-status" onchange="dashboard.applyFilters()"><option value="all">All Statuses</option></select></div>
+            <div class="filter-group"><label>Category</label><select id="filter-category" onchange="dashboard.applyFilters()"><option value="all">All Categories</option></select></div>
+            <div class="filter-group"><label>Effort Estimate</label><select id="filter-effort" onchange="dashboard.applyFilters()"><option value="all">All Efforts</option><option value="Low">Low (AI-Assisted)</option><option value="Medium">Medium</option><option value="High">High</option></select></div>
+            <div class="filter-group"><label>Age</label><select id="filter-age" onchange="dashboard.applyFilters()"><option value="all">All Ages</option><option value="New">New (&lt;3 mo)</option><option value="Recent">Recent (3-6 mo)</option><option value="Aging">Aging (6-12 mo)</option><option value="Legacy">Legacy (12+ mo)</option></select></div>
+            <div class="filter-group"><label>Type</label><select id="filter-type" onchange="dashboard.applyFilters()"><option value="all">All Types</option><option value="parent">Parent Ideas Only</option><option value="child">Sub-ideas Only</option></select></div>
+            <div class="filter-group"><label>Search</label><input type="text" id="filter-search" placeholder="Search ideas..." oninput="dashboard.applyFilters()"></div>
+        </div>
+    </div>
+    <div class="kpi-row">
+        <div class="kpi-card"><div class="kpi-label">Total Ideas</div><div class="kpi-value" id="kpi-total">0</div><div class="kpi-sub" id="kpi-total-sub"></div></div>
+        <div class="kpi-card" style="border-left-color:#e65100"><div class="kpi-label">Open / Under Review</div><div class="kpi-value" id="kpi-active">0</div><div class="kpi-sub" id="kpi-active-sub"></div></div>
+        <div class="kpi-card" style="border-left-color:#2e7d32"><div class="kpi-label">In Progress</div><div class="kpi-value" id="kpi-progress">0</div><div class="kpi-sub" id="kpi-progress-sub"></div></div>
+        <div class="kpi-card" style="border-left-color:var(--bbss-gold)"><div class="kpi-label">Quick Wins (Low Effort)</div><div class="kpi-value" id="kpi-quickwins">0</div><div class="kpi-sub" id="kpi-quickwins-sub"></div></div>
+        <div class="kpi-card" style="border-left-color:#7B1FA2"><div class="kpi-label">Legacy Ideas (12+ mo)</div><div class="kpi-value" id="kpi-legacy">0</div><div class="kpi-sub" id="kpi-legacy-sub"></div></div>
+        <div class="kpi-card" style="border-left-color:#c62828"><div class="kpi-label">Categories</div><div class="kpi-value" id="kpi-cats">0</div><div class="kpi-sub" id="kpi-cats-sub"></div></div>
+    </div>
+    <div class="chart-row">
+        <div class="chart-container"><h3>Ideas by Status</h3><canvas id="chart-status"></canvas></div>
+        <div class="chart-container"><h3>Ideas by Category</h3><canvas id="chart-category"></canvas></div>
+        <div class="chart-container"><h3>Effort Distribution</h3><canvas id="chart-effort"></canvas></div>
+        <div class="chart-container"><h3>Idea Age Distribution</h3><canvas id="chart-age"></canvas></div>
+    </div>
+    <div class="view-tabs">
+        <div class="view-tab active" onclick="dashboard.setView('mindmap')">Mind Map</div>
+        <div class="view-tab" onclick="dashboard.setView('matrix')">Impact / Effort Matrix</div>
+        <div class="view-tab" onclick="dashboard.setView('table')">Full Table</div>
+    </div>
+    <div id="view-mindmap" class="mindmap-section"><div class="mindmap-center" id="mindmap-content"></div></div>
+    <div id="view-matrix" class="matrix-section" style="display:none">
+        <h3 style="margin-bottom:16px">Impact vs. Effort Prioritization Matrix</h3>
+        <div class="matrix-grid">
+            <div class="matrix-corner">Impact / Effort</div>
+            <div class="matrix-col-header">Low Effort</div><div class="matrix-col-header">Medium Effort</div><div class="matrix-col-header">High Effort</div>
+            <div class="matrix-row-header">High Impact</div><div class="matrix-cell quickwin" id="cell-hi-lo"></div><div class="matrix-cell strategic" id="cell-hi-md"></div><div class="matrix-cell strategic" id="cell-hi-hi"></div>
+            <div class="matrix-row-header">Medium Impact</div><div class="matrix-cell quickwin" id="cell-md-lo"></div><div class="matrix-cell filler" id="cell-md-md"></div><div class="matrix-cell avoid" id="cell-md-hi"></div>
+            <div class="matrix-row-header">Low Impact</div><div class="matrix-cell filler" id="cell-lo-lo"></div><div class="matrix-cell avoid" id="cell-lo-md"></div><div class="matrix-cell avoid" id="cell-lo-hi"></div>
+        </div>
+        <div class="legend" style="margin-top:16px">
+            <div class="legend-item"><div class="legend-dot" style="background:#e8f5e9"></div> Quick Wins</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#e3f2fd"></div> Strategic</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#fffde7"></div> Fill-In</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#fce4ec"></div> Deprioritize</div>
+        </div>
+    </div>
+    <div id="view-table" class="table-section" style="display:none">
+        <div class="table-controls"><h3>All Ideas</h3><div class="table-count" id="table-count"></div></div>
+        <div id="table-container" style="max-height:600px;overflow-y:auto"></div>
+    </div>
+    <div class="detail-overlay" id="detail-overlay" onclick="if(event.target===this)dashboard.closeDetail()">
+        <div class="detail-panel" id="detail-panel"></div>
+    </div>
+</div>
+<script>
+const IDEAS = ${ideasJSON};
+const STATUS_COLORS={'Open':'#1565C0','Under Review':'#e65100','Ready for Review':'#7B1FA2','Ready for Work':'#00838F','In Progress':'#2e7d32',"Closed/Won't Do":'#757575','Other':'#9e9e9e'};
+const CATEGORY_COLORS={'Scheduling':'#1565C0','Customer Registration':'#00838F','Mobile App':'#6A1B9A','Reports':'#E65100','LessonBuddy UI':'#2E7D32','Payments':'#C62828','Communications':'#F9A825','Marketing':'#AD1457','Customer Account':'#0277BD','Staff Management':'#558B2F','Pricing':'#4E342E','Trials':'#00695C','Operations':'#37474F','CRM':'#BF360C','Training':'#1B5E20','Curriculum':'#283593','Pilots':'#880E4F','Facilities':'#546E7A'};
+
+function estimateEffort(n){n=n.toLowerCase();const lo=['report','filter','display','notification','email','disclaimer','pop-up','badge','symbol','reminder','hide','show','add','birthdate','zip code','date range','redirect','named tab','coloring book','pamphlet','poster','charm','backpack','tote','merch','gift','video','lobby','content'];const hi=['ai driven','dynamic pricing','offline','geofencing','subscription','ach','package pricing','scuba','demo app','registration improvement','crm improvement','feature match','schedule optimization','pilot enablement','duplicate account','merge'];if(lo.some(k=>n.includes(k)))return'Low';if(hi.some(k=>n.includes(k)))return'High';return'Medium'}
+function estimateImpact(n){n=n.toLowerCase();const hi=['customer registration','payment','pricing','subscription','ltv','promotions','schedule optimization','ai driven','trial','mobile app','push notification','communications','capacity'];const lo=['merch','coloring','charm','backpack','tote','pamphlet','poster','lobby','apparel','disclaimer','birthdate'];if(hi.some(k=>n.includes(k)))return'High';if(lo.some(k=>n.includes(k)))return'Low';return'Medium'}
+function getAge(d){const now=new Date();const dt=new Date(d);const m=(now.getFullYear()-dt.getFullYear())*12+(now.getMonth()-dt.getMonth());if(m<3)return'New';if(m<6)return'Recent';if(m<12)return'Aging';return'Legacy'}
+function getAgeDays(d){return Math.floor((new Date()-new Date(d))/(1000*60*60*24))}
+
+IDEAS.forEach(i=>{i.effort=estimateEffort(i.name);i.impact=estimateImpact(i.name);i.age=getAge(i.dateCreated||i.dateUpdated);i.ageDays=getAgeDays(i.dateCreated||i.dateUpdated);i.isParent=!i.parentName;const s=(i.status||'').toLowerCase();i.statusGroup=s==='open'?'Open':s.includes('under review')?'Under Review':s.includes('ready for review')?'Ready for Review':s.includes('ready for work')?'Ready for Work':s.includes('progress')?'In Progress':(s==='closed'||s.includes('not moving'))?"Closed/Won't Do":'Other'});
+
+class Dashboard{constructor(){this.rawData=IDEAS;this.filteredData=[...IDEAS];this.charts={};this.currentView='mindmap';this.sortCol='ageDays';this.sortDir='desc';this.init()}
+init(){this.populateFilters();this.renderAll()}
+populateFilters(){const ss=[...new Set(IDEAS.map(i=>i.statusGroup))].sort();const cs=[...new Set(IDEAS.map(i=>i.category))].sort();const sSel=document.getElementById('filter-status');ss.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sSel.appendChild(o)});const cSel=document.getElementById('filter-category');cs.forEach(c=>{const o=document.createElement('option');o.value=c;o.textContent=c;cSel.appendChild(o)})}
+applyFilters(){const st=document.getElementById('filter-status').value;const ct=document.getElementById('filter-category').value;const ef=document.getElementById('filter-effort').value;const ag=document.getElementById('filter-age').value;const ty=document.getElementById('filter-type').value;const se=document.getElementById('filter-search').value.toLowerCase();this.filteredData=this.rawData.filter(i=>{if(st!=='all'&&i.statusGroup!==st)return false;if(ct!=='all'&&i.category!==ct)return false;if(ef!=='all'&&i.effort!==ef)return false;if(ag!=='all'&&i.age!==ag)return false;if(ty==='parent'&&!i.isParent)return false;if(ty==='child'&&i.isParent)return false;if(se&&!i.name.toLowerCase().includes(se)&&!(i.customId||'').toLowerCase().includes(se))return false;return true});this.renderAll()}
+resetFilters(){['filter-status','filter-category','filter-effort','filter-age','filter-type'].forEach(id=>document.getElementById(id).value='all');document.getElementById('filter-search').value='';this.filteredData=[...this.rawData];this.renderAll()}
+renderAll(){this.renderKPIs();this.renderCharts();this.renderMindMap();this.renderMatrix();this.renderTable()}
+renderKPIs(){const d=this.filteredData;document.getElementById('kpi-total').textContent=d.length;document.getElementById('kpi-total-sub').textContent=d.filter(i=>i.isParent).length+' parent, '+d.filter(i=>!i.isParent).length+' sub-ideas';const ac=d.filter(i=>['Open','Under Review','Ready for Review'].includes(i.statusGroup));document.getElementById('kpi-active').textContent=ac.length;document.getElementById('kpi-active-sub').textContent=Math.round(ac.length/Math.max(d.length,1)*100)+'% of filtered';const pr=d.filter(i=>i.statusGroup==='In Progress');document.getElementById('kpi-progress').textContent=pr.length;document.getElementById('kpi-progress-sub').textContent=pr.map(i=>i.name.slice(0,20)).slice(0,3).join(', ');const qw=d.filter(i=>i.effort==='Low'&&!["Closed/Won't Do"].includes(i.statusGroup));document.getElementById('kpi-quickwins').textContent=qw.length;document.getElementById('kpi-quickwins-sub').textContent='AI-friendly, low effort';const lg=d.filter(i=>i.age==='Legacy');document.getElementById('kpi-legacy').textContent=lg.length;document.getElementById('kpi-legacy-sub').textContent='Submitted 12+ months ago';const cats=[...new Set(d.map(i=>i.category))];document.getElementById('kpi-cats').textContent=cats.length;document.getElementById('kpi-cats-sub').textContent=cats.slice(0,4).join(', ')}
+renderCharts(){const sc={};this.filteredData.forEach(i=>{sc[i.statusGroup]=(sc[i.statusGroup]||0)+1});const sL=Object.keys(sc).sort((a,b)=>sc[b]-sc[a]);if(this.charts.status)this.charts.status.destroy();this.charts.status=new Chart(document.getElementById('chart-status'),{type:'doughnut',data:{labels:sL,datasets:[{data:sL.map(l=>sc[l]),backgroundColor:sL.map(l=>(STATUS_COLORS[l]||'#999')+'CC'),borderColor:'#fff',borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,cutout:'55%',plugins:{legend:{position:'right',labels:{usePointStyle:true,padding:10,font:{size:11}}}}}});const cc={};this.filteredData.forEach(i=>{cc[i.category]=(cc[i.category]||0)+1});const cL=Object.keys(cc).sort((a,b)=>cc[b]-cc[a]).slice(0,12);if(this.charts.category)this.charts.category.destroy();this.charts.category=new Chart(document.getElementById('chart-category'),{type:'bar',data:{labels:cL,datasets:[{data:cL.map(l=>cc[l]),backgroundColor:cL.map(l=>(CATEGORY_COLORS[l]||'#78909C')+'BB'),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{beginAtZero:true},y:{grid:{display:false}}}}});const ec={Low:0,Medium:0,High:0};this.filteredData.forEach(i=>{ec[i.effort]++});if(this.charts.effort)this.charts.effort.destroy();this.charts.effort=new Chart(document.getElementById('chart-effort'),{type:'doughnut',data:{labels:['Low (AI-Friendly)','Medium','High'],datasets:[{data:[ec.Low,ec.Medium,ec.High],backgroundColor:['#66BB6A','#FFA726','#EF5350'],borderColor:'#fff',borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,cutout:'55%',plugins:{legend:{position:'right',labels:{usePointStyle:true,padding:10,font:{size:11}}}}}});const ac2={New:0,Recent:0,Aging:0,Legacy:0};this.filteredData.forEach(i=>{ac2[i.age]++});if(this.charts.age)this.charts.age.destroy();this.charts.age=new Chart(document.getElementById('chart-age'),{type:'bar',data:{labels:['New (<3mo)','Recent (3-6mo)','Aging (6-12mo)','Legacy (12+mo)'],datasets:[{data:[ac2.New,ac2.Recent,ac2.Aging,ac2.Legacy],backgroundColor:['#66BB6A','#42A5F5','#FFA726','#AB47BC'],borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true}}}})}
+renderMindMap(){const c=document.getElementById('mindmap-content');const cats={};this.filteredData.forEach(i=>{if(!cats[i.category])cats[i.category]=[];cats[i.category].push(i)});const sk=Object.keys(cats).sort((a,b)=>cats[b].length-cats[a].length);let h='';sk.forEach(cat=>{const items=cats[cat].sort((a,b)=>{const eo={Low:0,Medium:1,High:2};if(eo[a.effort]!==eo[b.effort])return eo[a.effort]-eo[b.effort];return b.ageDays-a.ageDays});const color=CATEGORY_COLORS[cat]||'#78909C';h+='<div class="mm-cluster" style="border-color:'+color+'40"><div class="mm-cluster-header" onclick="this.nextElementSibling.classList.toggle(\\'collapsed\\');this.querySelector(\\'.mm-cluster-toggle\\').textContent=this.nextElementSibling.classList.contains(\\'collapsed\\')?\\'+\\':\\'-\\'"><div style="width:14px;height:14px;border-radius:4px;background:'+color+';flex-shrink:0"></div><h4>'+cat+'</h4><span class="mm-cluster-badge">'+items.length+'</span><span class="mm-cluster-toggle">-</span></div><div class="mm-items">';items.forEach(item=>{const ec=item.effort==='Low'?'effort-low':item.effort==='Medium'?'effort-med':'effort-high';const sc2=STATUS_COLORS[item.statusGroup]||'#999';h+='<div class="mm-item" onclick="dashboard.showDetail(\\''+item.id+'\\')"><span class="dot" style="background:'+sc2+'"></span><span class="name">'+(item.isParent?'<strong>':'')+'<span style="color:#999;font-size:10px">'+(item.customId||'')+'</span> '+item.name+(item.isParent?'</strong>':'')+'</span><span class="effort-tag '+ec+'">'+item.effort+'</span></div>'});h+='</div></div>'});c.innerHTML=h}
+renderMatrix(){const cells={'hi-lo':[],'hi-md':[],'hi-hi':[],'md-lo':[],'md-md':[],'md-hi':[],'lo-lo':[],'lo-md':[],'lo-hi':[]};this.filteredData.filter(i=>!["Closed/Won't Do"].includes(i.statusGroup)).forEach(i=>{const im=i.impact==='High'?'hi':i.impact==='Medium'?'md':'lo';const ef=i.effort==='Low'?'lo':i.effort==='Medium'?'md':'hi';cells[im+'-'+ef].push(i)});Object.keys(cells).forEach(k=>{document.getElementById('cell-'+k).innerHTML=cells[k].map(i=>'<span class="matrix-chip" onclick="dashboard.showDetail(\\''+i.id+'\\')">'+( i.customId||i.name.slice(0,15))+'</span>').join('')})}
+renderTable(){const sorted=[...this.filteredData].sort((a,b)=>{let av=a[this.sortCol],bv=b[this.sortCol];if(typeof av==='string')av=av.toLowerCase();if(typeof bv==='string')bv=bv.toLowerCase();const cmp=av<bv?-1:av>bv?1:0;return this.sortDir==='asc'?cmp:-cmp});document.getElementById('table-count').textContent='Showing '+sorted.length+' ideas';const sb=sg=>{const cl=sg==='Open'?'status-open':sg.includes('Review')?'status-review':sg==='Ready for Work'?'status-ready':sg==='In Progress'?'status-progress':sg.includes('Closed')?'status-closed':'status-other';return'<span class="status-badge '+cl+'">'+sg+'</span>'};const ab=(a,d)=>{const cl=a==='New'?'age-new':a==='Recent'?'age-mid':a==='Aging'?'age-old':'age-legacy';return'<span class="age-badge '+cl+'">'+d+'d ('+a+')</span>'};const eb=e=>'<span class="effort-tag '+(e==='Low'?'effort-low':e==='Medium'?'effort-med':'effort-high')+'">'+e+'</span>';const ar=col=>this.sortCol===col?(this.sortDir==='asc'?' &#9650;':' &#9660;'):'';let h='<table class="data-table"><thead><tr><th onclick="dashboard.sort(\\'customId\\')">ID'+ar('customId')+'</th><th onclick="dashboard.sort(\\'name\\')">Name'+ar('name')+'</th><th onclick="dashboard.sort(\\'category\\')">Category'+ar('category')+'</th><th onclick="dashboard.sort(\\'statusGroup\\')">Status'+ar('statusGroup')+'</th><th onclick="dashboard.sort(\\'effort\\')">Effort'+ar('effort')+'</th><th onclick="dashboard.sort(\\'impact\\')">Impact'+ar('impact')+'</th><th onclick="dashboard.sort(\\'ageDays\\')">Age'+ar('ageDays')+'</th><th onclick="dashboard.sort(\\'assignees\\')">Assignees'+ar('assignees')+'</th></tr></thead><tbody>';sorted.forEach(i=>{h+='<tr onclick="dashboard.showDetail(\\''+i.id+'\\') " style="cursor:pointer"><td><a class="task-link" href="'+i.url+'" target="_blank" onclick="event.stopPropagation()">'+(i.customId||'-')+'</a></td><td>'+(i.isParent?'<strong>':'')+i.name+(i.parentName?' <span style="color:#999;font-size:10px">('+i.parentName+')</span>':'')+(i.isParent?'</strong>':'')+'</td><td><span class="category-tag">'+i.category+'</span></td><td>'+sb(i.statusGroup)+'</td><td>'+eb(i.effort)+'</td><td>'+eb(i.impact)+'</td><td>'+ab(i.age,i.ageDays)+'</td><td style="font-size:11px">'+(i.assignees||'-')+'</td></tr>'});h+='</tbody></table>';document.getElementById('table-container').innerHTML=h}
+sort(col){if(this.sortCol===col)this.sortDir=this.sortDir==='asc'?'desc':'asc';else{this.sortCol=col;this.sortDir='asc'}this.renderTable()}
+setView(v){this.currentView=v;document.querySelectorAll('.view-tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.view-tab').forEach(t=>{if(t.textContent.toLowerCase().includes(v.replace('mindmap','mind')))t.classList.add('active')});document.getElementById('view-mindmap').style.display=v==='mindmap'?'block':'none';document.getElementById('view-matrix').style.display=v==='matrix'?'block':'none';document.getElementById('view-table').style.display=v==='table'?'block':'none'}
+showDetail(id){const i=this.rawData.find(x=>x.id===id);if(!i)return;const ch=this.rawData.filter(x=>x.parentName===i.name);const p=document.getElementById('detail-panel');p.innerHTML='<button class="detail-close" onclick="dashboard.closeDetail()">&times;</button><h2>'+i.name+'</h2><div class="detail-row"><div class="detail-label">ID</div><div class="detail-value"><a href="'+i.url+'" target="_blank">'+(i.customId||i.id)+'</a></div></div><div class="detail-row"><div class="detail-label">Status</div><div class="detail-value">'+i.statusGroup+' ('+i.status+')</div></div><div class="detail-row"><div class="detail-label">Category</div><div class="detail-value">'+i.category+'</div></div><div class="detail-row"><div class="detail-label">Effort</div><div class="detail-value"><span class="effort-tag '+(i.effort==='Low'?'effort-low':i.effort==='Medium'?'effort-med':'effort-high')+'">'+i.effort+'</span>'+(i.effort==='Low'?' - Could leverage AI tools':'')+'</div></div><div class="detail-row"><div class="detail-label">Impact</div><div class="detail-value"><span class="effort-tag '+(i.impact==='High'?'effort-high':i.impact==='Medium'?'effort-med':'effort-low')+'">'+i.impact+'</span></div></div><div class="detail-row"><div class="detail-label">Age</div><div class="detail-value">'+i.ageDays+' days ('+i.age+')</div></div><div class="detail-row"><div class="detail-label">Created</div><div class="detail-value">'+(i.dateCreated||'N/A')+'</div></div><div class="detail-row"><div class="detail-label">Last Updated</div><div class="detail-value">'+i.dateUpdated+'</div></div><div class="detail-row"><div class="detail-label">Assignees</div><div class="detail-value">'+(i.assignees||'Unassigned')+'</div></div>'+(i.parentName?'<div class="detail-row"><div class="detail-label">Parent Idea</div><div class="detail-value">'+i.parentName+'</div></div>':'')+(ch.length?'<div class="detail-row"><div class="detail-label">Sub-ideas ('+ch.length+')</div><div class="detail-value">'+ch.map(c=>'<div style="margin:2px 0"><span class="effort-tag '+(c.effort==='Low'?'effort-low':c.effort==='Medium'?'effort-med':'effort-high')+'" style="margin-right:4px">'+c.effort+'</span>'+c.name+'</div>').join('')+'</div></div>':'')+'<div style="margin-top:16px;padding-top:12px;border-top:1px solid #eee"><a href="'+i.url+'" target="_blank" style="color:var(--bbss-blue);font-weight:600;text-decoration:none">Open in ClickUp &rarr;</a></div>';document.getElementById('detail-overlay').classList.add('active')}
+closeDetail(){document.getElementById('detail-overlay').classList.remove('active')}}
+const dashboard=new Dashboard();
+<\/script>
+</body>
+</html>`;
+}
+
+// ── Main ────────────────────────────────────────────────────────────
+async function main() {
+  console.log('Fetching tasks from ClickUp list:', LIST_ID);
+  const tasks = await fetchAllTasks();
+  const ideas = transformTasks(tasks);
+  console.log(`Transformed ${ideas.length} ideas`);
+
+  const html = generateHTML(ideas);
+  fs.writeFileSync('index.html', html, 'utf8');
+  console.log('Dashboard written to index.html');
+}
+
+main().catch(err => {
+  console.error('Build failed:', err);
+  process.exit(1);
+});
